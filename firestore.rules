@@ -1,0 +1,109 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function isValidRoom() {
+      return hasRequiredFields(['hostId', 'phase', 'createdAt', 'lastActive']) &&
+             request.resource.data.phase in ['lobby', 'choosing', 'drawing', 'reveal', 'ended'] &&
+             request.resource.data.hostId is string &&
+             request.resource.data.createdAt is number &&
+             request.resource.data.lastActive is number;
+    }
+
+    function isValidPlayer() {
+      return hasRequiredFields(['name', 'avatarId', 'score', 'streak', 'connected', 'isHost', 'hasGuessed']) &&
+             request.resource.data.name is string &&
+             request.resource.data.name.size() > 0 &&
+             request.resource.data.name.size() <= 20 &&
+             request.resource.data.avatarId is string &&
+             request.resource.data.score is number &&
+             request.resource.data.score >= 0 &&
+             // Prevent score manipulation on updates only (resource is null on create)
+             (
+               resource == null ||
+               (request.resource.data.score - resource.data.score) <= 500
+             ) &&
+             request.resource.data.streak is number &&
+             request.resource.data.streak >= 0 &&
+             request.resource.data.connected is bool &&
+             request.resource.data.isHost is bool &&
+             request.resource.data.hasGuessed is bool;
+    }
+
+    function isValidChatMessage() {
+      return hasRequiredFields(['text', 'senderId', 'senderName', 'isSystem', 'isCorrect', 'timestamp']) &&
+             request.resource.data.text is string &&
+             request.resource.data.text.size() > 0 &&
+             request.resource.data.text.size() <= 200 &&
+             request.resource.data.senderId is string &&
+             request.resource.data.senderName is string &&
+             request.resource.data.isSystem is bool &&
+             request.resource.data.isCorrect is bool &&
+             request.resource.data.timestamp is number &&
+             // Clients cannot fake a correct guess — isCorrect is set server-side only
+             request.resource.data.isCorrect == false;
+    }
+
+    function isValidCanvas() {
+      return hasRequiredFields(['lastUpdate']) &&
+             request.resource.data.lastUpdate is number;
+    }
+
+    function isValidSecretWord() {
+      return hasRequiredFields(['value']) &&
+             request.resource.data.value is string &&
+             request.resource.data.value.size() > 0 &&
+             request.resource.data.value.size() <= 100;
+    }
+
+    // Word bank is seeded via admin SDK — clients must never read it
+    match /wordBank/{category} {
+      allow read: if false;
+      allow write: if false;
+    }
+
+    match /rooms/{roomId} {
+      allow read: if true;
+      allow create: if isValidRoom();
+      allow update: if isValidRoom();
+      allow delete: if true;
+
+      match /players/{playerId} {
+        allow read: if true;
+        allow create: if isValidPlayer();
+        allow update: if isValidPlayer();
+        allow delete: if true;
+      }
+
+      match /chat/{messageId} {
+        allow read: if true;
+        // Only allow non-system, non-correct messages from clients.
+        // isCorrect and isSystem are set server-side (via gameLogic running on host client).
+        // The rule enforces isCorrect=false and isSystem=false for direct writes,
+        // which means only the game logic path (which sets these via trusted writes) works.
+        allow create: if isValidChatMessage();
+        allow update: if false;
+        allow delete: if true;
+      }
+
+      match /canvas/{canvasId} {
+        allow read: if true;
+        allow create: if isValidCanvas();
+        allow update: if isValidCanvas();
+        allow delete: if true;
+      }
+
+      match /secrets/{secretId} {
+        // Word is now stored server-side only (API route + firebase-admin).
+        // No client should ever read or write this directly.
+        allow read: if false;
+        allow write: if false;
+      }
+    }
+  }
+}

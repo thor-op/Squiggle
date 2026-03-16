@@ -1,0 +1,116 @@
+{
+  "entities": {
+    "Room": {
+      "title": "Room",
+      "description": "A game room",
+      "type": "object",
+      "properties": {
+        "hostId": { "type": "string" },
+        "phase": { "type": "string", "enum": ["lobby", "choosing", "drawing", "reveal", "ended"] },
+        "settings": {
+          "type": "object",
+          "properties": {
+            "rounds": { "type": "number" },
+            "drawTime": { "type": "number" },
+            "categories": { "type": "array", "items": { "type": "string" } },
+            "customWords": { "type": "string" },
+            "password": { "type": "string" }
+          }
+        },
+        "currentRound": {
+          "type": "object",
+          "properties": {
+            "drawerId": { "type": "string" },
+            "wordMask": { "type": "string" },
+            "wordLength": { "type": "number" },
+            "startedAt": { "type": "number" },
+            "timeLimit": { "type": "number" },
+            "roundNumber": { "type": "number" }
+          }
+        },
+        "wordChoices": { "type": "array", "items": { "type": "string" } },
+        "reveal": {
+          "type": "object",
+          "properties": {
+            "word": { "type": "string" }
+          }
+        },
+        "createdAt": { "type": "number" },
+        "lastActive": { "type": "number" }
+      },
+      "required": ["hostId", "phase", "createdAt", "lastActive"]
+    },
+    "Player": {
+      "title": "Player",
+      "description": "A player in a room",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "avatarId": { "type": "string" },
+        "score": { "type": "number" },
+        "streak": { "type": "number" },
+        "connected": { "type": "boolean" },
+        "isHost": { "type": "boolean" },
+        "hasGuessed": { "type": "boolean" }
+      },
+      "required": ["name", "avatarId", "score", "streak", "connected", "isHost", "hasGuessed"]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "A chat message in a room",
+      "type": "object",
+      "properties": {
+        "text": { "type": "string" },
+        "senderId": { "type": "string" },
+        "senderName": { "type": "string" },
+        "isSystem": { "type": "boolean" },
+        "isCorrect": { "type": "boolean" },
+        "timestamp": { "type": "number" }
+      },
+      "required": ["text", "senderId", "senderName", "isSystem", "isCorrect", "timestamp"]
+    },
+    "Canvas": {
+      "title": "Canvas",
+      "description": "The drawing canvas state",
+      "type": "object",
+      "properties": {
+        "completedStrokes": { "type": "string" },
+        "activeStroke": { "type": "string" },
+        "clearedAt": { "type": "number" },
+        "lastUpdate": { "type": "number" }
+      },
+      "required": ["lastUpdate"]
+    },
+    "SecretWord": {
+      "title": "SecretWord",
+      "description": "The secret word for the current round",
+      "type": "object",
+      "properties": {
+        "value": { "type": "string" }
+      },
+      "required": ["value"]
+    }
+  },
+  "firestore": {
+    "rooms/{roomId}": {
+      "schema": { "$ref": "Room" },
+      "description": "Game rooms"
+    },
+    "rooms/{roomId}/players/{playerId}": {
+      "schema": { "$ref": "Player" },
+      "description": "Players in a room"
+    },
+    "rooms/{roomId}/chat/{messageId}": {
+      "schema": { "$ref": "ChatMessage" },
+      "description": "Chat messages in a room"
+    },
+    "rooms/{roomId}/canvas/{canvasId}": {
+      "schema": { "$ref": "Canvas" },
+      "description": "Canvas state for a room"
+    },
+    "rooms/{roomId}/secrets/{secretId}": {
+      "schema": { "$ref": "SecretWord" },
+      "description": "Secret word for a room"
+    }
+  }
+}

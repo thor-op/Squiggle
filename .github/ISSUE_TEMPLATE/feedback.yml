@@ -1,0 +1,23 @@
+name: Feedback / Feature Request
+description: Ideas, suggestions, or general feedback
+labels: ["feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: "## Got an idea or feedback?"
+  - type: textarea
+    id: feedback
+    attributes:
+      label: What's on your mind?
+      placeholder: Share your thoughts...
+    validations:
+      required: true
+  - type: dropdown
+    id: type
+    attributes:
+      label: Type
+      options:
+        - Feature request
+        - UI / UX improvement
+        - Performance
+        - Other
