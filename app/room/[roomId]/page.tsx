@@ -6,7 +6,7 @@ import { getPlayerId, getPlayerProfile, setPlayerProfile } from '@/lib/store';
 import { rtdb } from '@/lib/firebase';
 import { ref, onValue, update, remove } from 'firebase/database';
 import { Room, Player } from '@/lib/types';
-import { createOrJoinRoom, startGame, selectWord, endRound, nextTurn, sendSystemMessage } from '@/lib/gameLogic';
+import { createOrJoinRoom, startGame, selectWord, endRound, nextTurn, sendSystemMessage, fetchWordChoices } from '@/lib/gameLogic';
 import { Copy, Check, Crown, Brush, LogOut, Bug, Lightbulb, MessageSquare, X } from 'lucide-react';
 import Canvas from '@/components/Canvas';
 import Chat from '@/components/Chat';
@@ -220,12 +220,30 @@ export default function RoomPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [room?.phase, room?.currentRound?.drawerId, player?.id, player?.hasGuessed]);
 
-  const revealedHints = useRef<Set<number>>(new Set());
+  // Pre-fetched choices for startGame (fetched while in lobby)
+  const lobbyPrefetchedChoices = useRef<string[] | null>(null);
+
+  // Prefetch word choices while in lobby so startGame is instant
+  useEffect(() => {
+    if (!room || room.phase !== 'lobby' || !player?.isHost) return;
+    lobbyPrefetchedChoices.current = null;
+    const categories = Array.isArray(room.settings.categories)
+      ? room.settings.categories
+      : Object.keys(room.settings.categories as Record<string, boolean>);
+    fetchWordChoices(categories, room.settings.customWords, room.settings.wordCount ?? 3)
+      .then(c => { lobbyPrefetchedChoices.current = c; })
+      .catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [room?.phase, room?.settings, player?.isHost]);
   const lastRoundId = useRef<string>('');
   const transitionFired = useRef<string>('');
-  // Optimistic startedAt: set locally when we trigger selectWord so timer doesn't wait for snapshot
-  const localStartedAt = useRef<number | null>(null);
-  const localPhase = useRef<string>('');
+  const revealedHints = useRef<Set<number>>(new Set());
+  // Authoritative startedAt from server — set when selectWord responds, used for timer
+  const authStartedAt = useRef<number | null>(null);
+  const authPhase = useRef<string>('');
+  // Pre-fetched word choices for the next turn — fetched during drawing so nextTurn is instant
+  const prefetchedChoices = useRef<string[] | null>(null);
+  const prefetchedFor = useRef<string>(''); // roundKey when prefetch was done
   // Always-fresh refs so the interval closure never reads stale state
   const roomRef = useRef<Room | null>(null);
   const playersRef = useRef<Player[]>([]);
@@ -241,9 +259,9 @@ export default function RoomPage() {
       const player = playerRef.current;
       if (!room?.currentRound) return;
 
-      // Use optimistic local startedAt if we just triggered a phase change, else use Firestore value
-      const startedAt = (localPhase.current === room.phase && localStartedAt.current)
-        ? localStartedAt.current
+      // Use authoritative startedAt from server if available for this phase, else RTDB value
+      const startedAt = (authPhase.current === room.phase && authStartedAt.current)
+        ? authStartedAt.current
         : room.currentRound.startedAt;
 
       const elapsed = (Date.now() - startedAt) / 1000;
@@ -255,11 +273,22 @@ export default function RoomPage() {
         lastRoundId.current = roundKey;
         revealedHints.current = new Set();
         transitionFired.current = '';
-        // Clear optimistic ref when Firestore confirms the new phase
-        if (localPhase.current === room.phase) { localStartedAt.current = null; localPhase.current = ''; }
+        // Clear auth ref once RTDB confirms the phase we set
+        if (authPhase.current === room.phase) { authStartedAt.current = null; authPhase.current = ''; }
       }
 
       if (!player?.isHost) return;
+
+      // Pre-fetch next word choices during drawing phase so nextTurn is instant
+      if (room.phase === 'drawing' && prefetchedFor.current !== roundKey && !prefetchedChoices.current) {
+        prefetchedFor.current = roundKey;
+        const categories = Array.isArray(room.settings.categories)
+          ? room.settings.categories
+          : Object.keys(room.settings.categories as Record<string, boolean>);
+        fetchWordChoices(categories, room.settings.customWords, room.settings.wordCount ?? 3)
+          .then(c => { prefetchedChoices.current = c; })
+          .catch(() => {});
+      }
 
       if (room.phase === 'drawing' && room.settings.hints > 0) {
         const hintInterval = room.settings.hintInterval ?? 20;
@@ -277,17 +306,22 @@ export default function RoomPage() {
       const shouldTransition = rem <= 0 || (room.phase === 'drawing' && (allGuessed || skipVotes > guessers.length / 2));
       if (shouldTransition && transitionFired.current !== room.phase) {
         transitionFired.current = room.phase;
-        // Record optimistic startedAt before the async API call so timer resets immediately
-        localStartedAt.current = Date.now();
         if (room.phase === 'choosing') {
-          localPhase.current = 'drawing';
-          selectWord(roomId, room.wordChoices?.[0] || 'apple', room.currentRound!.drawerId, room.settings.drawTime ?? 80);
+          authPhase.current = 'drawing';
+          // selectWord returns the server's authoritative startedAt — use it for the timer
+          selectWord(roomId, room.wordChoices?.[0] || 'apple', room.currentRound!.drawerId, room.settings.drawTime ?? 80)
+            .then(serverStartedAt => { authStartedAt.current = serverStartedAt; });
         } else if (room.phase === 'drawing') {
-          localPhase.current = 'reveal';
+          authPhase.current = 'reveal';
+          authStartedAt.current = Date.now();
           endRound(roomId);
         } else if (room.phase === 'reveal') {
-          localPhase.current = 'choosing';
-          nextTurn(roomId, room, players);
+          authPhase.current = 'choosing';
+          authStartedAt.current = Date.now();
+          // Pass pre-fetched choices so nextTurn doesn't need to fetch
+          const choices = prefetchedChoices.current ?? undefined;
+          prefetchedChoices.current = null;
+          nextTurn(roomId, room, players, choices);
         }
       }
     }, 1000);
@@ -615,7 +649,11 @@ export default function RoomPage() {
                 <p className="text-black text-[10px] uppercase tracking-widest font-bold mb-6">Choose a word</p>
                 <div className="flex flex-col sm:flex-row gap-3 px-4">
                   {room.wordChoices?.map(word => (
-                    <button key={word} onClick={() => selectWord(roomId, word, room.currentRound!.drawerId, room.settings.drawTime ?? 80)}
+                    <button key={word} onClick={() => {
+                      authPhase.current = 'drawing';
+                      selectWord(roomId, word, room.currentRound!.drawerId, room.settings.drawTime ?? 80)
+                        .then(serverStartedAt => { authStartedAt.current = serverStartedAt; });
+                    }}
                       className="relative border border-black px-6 sm:px-8 py-3 sm:py-4 text-base sm:text-lg font-bold text-black hover:bg-black hover:text-white transition-all">
                       <Corners size={6} weight={1} color="text-zinc-400" />
                       {word}

@@ -4,8 +4,7 @@
  * Word bank stays in Firestore (admin-only).
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { getFirestore } from 'firebase-admin/firestore';
-import { getAdminDb, initAdminApp } from '@/lib/firebaseAdmin';
+import { getAdminDb } from '@/lib/firebaseAdmin';
 import { getWordMask } from '@/lib/words';
 import { revealHintLetter } from '@/lib/gameLogic';
 
@@ -74,9 +73,11 @@ export async function POST(req: NextRequest) {
 
   if (action === 'getWordChoices') {
     const { categories, customWords, wordCount } = body;
-    initAdminApp();
+    const db = getAdminDb(); // ensures initAdminApp runs with databaseURL
+    const { getFirestore } = await import('firebase-admin/firestore');
     const fsDb = getFirestore();
     const choices = await getRandomWordsFromDB(fsDb, categories ?? [], customWords ?? '', wordCount ?? 3);
+    void db; // db init side-effect only
     return NextResponse.json({ choices });
   }
 
@@ -165,15 +166,17 @@ export async function POST(req: NextRequest) {
     }
 
     const db = getAdminDb();
-    const [playerSnap, guessCountSnap] = await Promise.all([
+    const [playerSnap, guessCountSnap, drawerIdSnap] = await Promise.all([
       db.ref(`players/${roomId}/${playerId}`).get(),
       db.ref(`rooms/${roomId}/currentRound/guessCount`).get(),
+      db.ref(`rooms/${roomId}/currentRound/drawerId`).get(),
     ]);
 
     const freshPlayer = playerSnap.exists() ? playerSnap.val() : null;
     if (!freshPlayer || freshPlayer.hasGuessed) return NextResponse.json({ correct: false, reason: 'already guessed' });
 
     const guessOrder = (guessCountSnap.exists() ? guessCountSnap.val() : 0) + 1;
+    const drawerIdVal = drawerIdSnap.val();
     const totalTime = entry.drawTime;
     const elapsed = (Date.now() - entry.startedAt) / 1000;
     const timeLeft = Math.max(0, totalTime - elapsed);
@@ -189,7 +192,11 @@ export async function POST(req: NextRequest) {
     entry.totalGuessElapsed += elapsed;
 
     const msgKey = db.ref(`chat/${roomId}`).push().key!;
-    const drawerIdVal = (await db.ref(`rooms/${roomId}/currentRound/drawerId`).get()).val();
+
+    // Fetch drawer score in parallel if needed
+    const drawerSnap = (drawerIdVal && drawerIdVal !== playerId)
+      ? await db.ref(`players/${roomId}/${drawerIdVal}`).get()
+      : null;
 
     const updates: Record<string, unknown> = {
       [`chat/${roomId}/${msgKey}`]: {
@@ -205,27 +212,23 @@ export async function POST(req: NextRequest) {
       [`rooms/${roomId}/currentRound/guessCount`]: guessOrder,
     };
 
-    // Drawer gets +25 per correct guess + speed bonus
-    if (drawerIdVal && drawerIdVal !== playerId) {
-      const drawerSnap = await db.ref(`players/${roomId}/${drawerIdVal}`).get();
-      if (drawerSnap.exists()) {
-        const speedBonus = timeLeft / totalTime >= 0.75 ? 15 : timeLeft / totalTime >= 0.5 ? 8 : 0;
-        updates[`players/${roomId}/${drawerIdVal}/score`] = (drawerSnap.val().score || 0) + 25 + speedBonus;
-      }
+    if (drawerSnap?.exists()) {
+      const speedBonus = timeLeft / totalTime >= 0.75 ? 15 : timeLeft / totalTime >= 0.5 ? 8 : 0;
+      updates[`players/${roomId}/${drawerIdVal}/score`] = (drawerSnap.val().score || 0) + 25 + speedBonus;
     }
 
     await db.ref().update(updates);
 
-    // Check all-guessed bonus for drawer
+    // All-guessed bonus — check after main update
     const allPlayersSnap = await db.ref(`players/${roomId}`).get();
-    if (allPlayersSnap.exists()) {
+    if (allPlayersSnap.exists() && drawerIdVal) {
       const allPlayers = allPlayersSnap.val() as Record<string, { hasGuessed: boolean; score: number }>;
       const nonDrawers = Object.entries(allPlayers).filter(([id]) => id !== drawerIdVal);
       const allGuessed = nonDrawers.length > 0 && nonDrawers.every(([id, p]) => id === playerId || p.hasGuessed);
-      if (allGuessed && drawerIdVal) {
-        const drawerSnap = await db.ref(`players/${roomId}/${drawerIdVal}`).get();
-        if (drawerSnap.exists()) {
-          await db.ref(`players/${roomId}/${drawerIdVal}/score`).set((drawerSnap.val().score || 0) + 50);
+      if (allGuessed) {
+        const dSnap = await db.ref(`players/${roomId}/${drawerIdVal}`).get();
+        if (dSnap.exists()) {
+          await db.ref(`players/${roomId}/${drawerIdVal}/score`).set((dSnap.val().score || 0) + 50);
         }
       }
     }
@@ -253,22 +256,24 @@ export async function POST(req: NextRequest) {
     const entry = await getEntry(roomId);
     const word = entry?.word ?? 'unknown';
     const now = Date.now();
+    const db = getAdminDb();
 
-    if (entry) {
-      const db = getAdminDb();
+    // Consolation points for drawer if no one guessed — read + write in parallel with reveal update
+    const consolationPromise = (async () => {
+      if (!entry?.drawerId) return;
       const guessCountSnap = await db.ref(`rooms/${roomId}/currentRound/guessCount`).get();
-      const guessCount = guessCountSnap.exists() ? guessCountSnap.val() : 0;
-      if (guessCount === 0 && entry.drawerId) {
+      if ((guessCountSnap.exists() ? guessCountSnap.val() : 0) === 0) {
         const drawerSnap = await db.ref(`players/${roomId}/${entry.drawerId}`).get();
         if (drawerSnap.exists()) {
           await db.ref(`players/${roomId}/${entry.drawerId}/score`).set((drawerSnap.val().score || 0) + 5);
         }
       }
-    }
+    })();
 
     wordStore.delete(roomId);
-    const db = getAdminDb();
+
     await Promise.all([
+      consolationPromise,
       db.ref(`secrets/${roomId}/word`).remove(),
       db.ref(`rooms/${roomId}`).update({
         phase: 'reveal',

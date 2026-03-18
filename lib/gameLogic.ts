@@ -1,8 +1,8 @@
 import { rtdb } from './firebase';
-import { ref, set, update, get, push, serverTimestamp } from 'firebase/database';
+import { ref, set, update, get, push } from 'firebase/database';
 import { Room, Player, RoomSettings } from './types';
 
-async function fetchWordChoices(categories: string[], customWords: string, count: number): Promise<string[]> {
+export async function fetchWordChoices(categories: string[], customWords: string, count: number): Promise<string[]> {
   const res = await fetch('/api/game', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -159,7 +159,7 @@ export async function sendChatMessage(
   return false;
 }
 
-export async function startGame(roomId: string, players: Player[], settings: RoomSettings) {
+export async function startGame(roomId: string, players: Player[], settings: RoomSettings, prefetchedChoices?: string[]) {
   const shuffled = [...players].sort(() => Math.random() - 0.5);
   const turnOrder = shuffled.map(p => p.id);
   const firstDrawer = shuffled[0];
@@ -168,13 +168,15 @@ export async function startGame(roomId: string, players: Player[], settings: Roo
   const wordCount = settings.wordCount ?? 3;
 
   const [choices] = await Promise.all([
-    fetchWordChoices(
-      Array.isArray(settings.categories)
-        ? settings.categories
-        : Object.keys(settings.categories as Record<string, boolean>),
-      settings.customWords,
-      wordCount
-    ),
+    prefetchedChoices
+      ? Promise.resolve(prefetchedChoices)
+      : fetchWordChoices(
+          Array.isArray(settings.categories)
+            ? settings.categories
+            : Object.keys(settings.categories as Record<string, boolean>),
+          settings.customWords,
+          wordCount
+        ),
     (async () => {
       const updates: Record<string, unknown> = {};
       players.forEach(p => {
@@ -213,12 +215,15 @@ export async function startGame(roomId: string, players: Player[], settings: Roo
   await update(ref(rtdb), updates);
 }
 
-export async function selectWord(roomId: string, word: string, drawerId: string, drawTime: number) {
-  await fetch('/api/game', {
+export async function selectWord(roomId: string, word: string, drawerId: string, drawTime: number): Promise<number> {
+  const res = await fetch('/api/game', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action: 'selectWord', roomId, word, drawerId, drawTime }),
   });
+  const data = await res.json();
+  // Return the authoritative startedAt from the server so the client timer is exact
+  return data.startedAt ?? Date.now();
 }
 
 export async function endRound(roomId: string) {
@@ -229,7 +234,7 @@ export async function endRound(roomId: string) {
   });
 }
 
-export async function nextTurn(roomId: string, room: Room, players: Player[]) {
+export async function nextTurn(roomId: string, room: Room, players: Player[], prefetchedChoices?: string[]) {
   if (!room.currentRound) return;
 
   const turnOrder = room.turnOrder ?? [...players].sort((a, b) => a.id.localeCompare(b.id)).map(p => p.id);
@@ -253,8 +258,9 @@ export async function nextTurn(roomId: string, room: Room, players: Player[]) {
     ? room.settings.categories
     : Object.keys(room.settings.categories as Record<string, boolean>);
 
+  // Use pre-fetched choices if available, otherwise fetch now (fallback)
   const [choices] = await Promise.all([
-    fetchWordChoices(categories, room.settings.customWords, wordCount),
+    prefetchedChoices ?? fetchWordChoices(categories, room.settings.customWords, wordCount),
     (async () => {
       const updates: Record<string, unknown> = {};
       players.forEach(p => { updates[`players/${roomId}/${p.id}/hasGuessed`] = false; });
