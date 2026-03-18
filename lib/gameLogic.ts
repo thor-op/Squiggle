@@ -1,6 +1,7 @@
 import { rtdb } from './firebase';
 import { ref, set, update, get, push } from 'firebase/database';
 import { Room, Player, RoomSettings } from './types';
+import { getWordMask } from './words';
 
 export async function fetchWordChoices(categories: string[], customWords: string, count: number): Promise<string[]> {
   const res = await fetch('/api/game', {
@@ -216,22 +217,52 @@ export async function startGame(roomId: string, players: Player[], settings: Roo
 }
 
 export async function selectWord(roomId: string, word: string, drawerId: string, drawTime: number): Promise<number> {
-  const res = await fetch('/api/game', {
+  const mask = getWordMask(word);
+  const now = Date.now();
+
+  // Write phase transition to RTDB immediately — no server round-trip, no cold start
+  await Promise.all([
+    update(ref(rtdb), {
+      [`rooms/${roomId}/phase`]: 'drawing',
+      [`rooms/${roomId}/wordChoices`]: null,
+      [`rooms/${roomId}/currentRound/wordMask`]: mask,
+      [`rooms/${roomId}/currentRound/wordLength`]: word.length,
+      [`rooms/${roomId}/currentRound/startedAt`]: now,
+      [`rooms/${roomId}/currentRound/timeLimit`]: drawTime,
+      [`rooms/${roomId}/currentRound/guessCount`]: 0,
+      [`rooms/${roomId}/lastActive`]: now,
+    }),
+    set(ref(rtdb, `canvas/${roomId}`), {
+      completedStrokes: '[]', activeStroke: null, clearedAt: now, lastUpdate: now,
+    }),
+  ]);
+
+  // Store secret word server-side in background — doesn't block the timer
+  fetch('/api/game', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'selectWord', roomId, word, drawerId, drawTime }),
-  });
-  const data = await res.json();
-  // Return the authoritative startedAt from the server so the client timer is exact
-  return data.startedAt ?? Date.now();
+    body: JSON.stringify({ action: 'selectWord', roomId, word, drawerId, drawTime, startedAt: now }),
+  }).catch(() => {});
+
+  return now;
 }
 
 export async function endRound(roomId: string) {
-  await fetch('/api/game', {
+  const now = Date.now();
+  // Write reveal phase immediately to RTDB — no cold start wait
+  await update(ref(rtdb), {
+    [`rooms/${roomId}/phase`]: 'reveal',
+    [`rooms/${roomId}/votes/skip`]: {},
+    [`rooms/${roomId}/currentRound/startedAt`]: now,
+    [`rooms/${roomId}/currentRound/timeLimit`]: 5,
+    [`rooms/${roomId}/lastActive`]: now,
+  });
+  // Tell server to score + store word reveal in background
+  fetch('/api/game', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action: 'endRound', roomId }),
-  });
+  }).catch(() => {});
 }
 
 export async function nextTurn(roomId: string, room: Room, players: Player[], prefetchedChoices?: string[]) {

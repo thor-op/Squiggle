@@ -97,11 +97,13 @@ export async function POST(req: NextRequest) {
   }
 
   if (action === 'selectWord') {
-    const { roomId, word, drawerId, drawTime } = body;
+    // Client already wrote phase/startedAt to RTDB directly (no cold start delay).
+    // Server only needs to store the secret word and return confirmation.
+    const { roomId, word, drawerId, drawTime, startedAt } = body;
     if (!roomId || !word || !drawerId) return NextResponse.json({ error: 'missing fields' }, { status: 400 });
 
     const mask = getWordMask(word);
-    const now = Date.now();
+    const now = startedAt ?? Date.now(); // use client-provided startedAt so server clock matches
     wordStore.set(roomId, {
       word, drawerId,
       startedAt: now,
@@ -113,22 +115,8 @@ export async function POST(req: NextRequest) {
     });
 
     const db = getAdminDb();
-    await Promise.all([
-      db.ref(`secrets/${roomId}/word`).set({ value: word, drawerId, mask }),
-      db.ref(`rooms/${roomId}`).update({
-        phase: 'drawing',
-        wordChoices: null,
-        'currentRound/wordMask': mask,
-        'currentRound/wordLength': word.length,
-        'currentRound/startedAt': now,
-        'currentRound/timeLimit': drawTime ?? 80,
-        'currentRound/guessCount': 0,
-        lastActive: now,
-      }),
-      db.ref(`canvas/${roomId}`).set({
-        completedStrokes: '[]', activeStroke: null, clearedAt: now, lastUpdate: now,
-      }),
-    ]);
+    // Only store secret — room update already done by client
+    await db.ref(`secrets/${roomId}/word`).set({ value: word, drawerId, mask, startedAt: now });
 
     return NextResponse.json({ ok: true, mask, startedAt: now });
   }
@@ -255,10 +243,9 @@ export async function POST(req: NextRequest) {
     const { roomId } = body;
     const entry = await getEntry(roomId);
     const word = entry?.word ?? 'unknown';
-    const now = Date.now();
     const db = getAdminDb();
 
-    // Consolation points for drawer if no one guessed — read + write in parallel with reveal update
+    // Consolation points + reveal word — phase already set by client
     const consolationPromise = (async () => {
       if (!entry?.drawerId) return;
       const guessCountSnap = await db.ref(`rooms/${roomId}/currentRound/guessCount`).get();
@@ -275,14 +262,8 @@ export async function POST(req: NextRequest) {
     await Promise.all([
       consolationPromise,
       db.ref(`secrets/${roomId}/word`).remove(),
-      db.ref(`rooms/${roomId}`).update({
-        phase: 'reveal',
-        'reveal/word': word,
-        'votes/skip': {},
-        'currentRound/startedAt': now,
-        'currentRound/timeLimit': 5,
-        lastActive: now,
-      }),
+      // Write the revealed word (phase already set by client)
+      db.ref(`rooms/${roomId}/reveal`).set({ word }),
     ]);
     return NextResponse.json({ ok: true, word });
   }
