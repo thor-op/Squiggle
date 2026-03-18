@@ -213,10 +213,15 @@ export default function RoomPage() {
 
   useEffect(() => {
     if (!player || !room?.currentRound || room.phase !== 'drawing') { setSecretWord(null); return; }
-    // Fetch word if you're the drawer OR if you've already guessed correctly
     if (room.currentRound.drawerId !== player.id && !player.hasGuessed) { setSecretWord(null); return; }
-    fetch('/api/game', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'getWord', roomId, playerId: player.id }) })
-      .then(r => r.json()).then(d => setSecretWord(d.word ?? null)).catch(() => setSecretWord(null));
+    // If we already have the word (drawer just picked it), don't overwrite with a slow API call
+    setSecretWord(prev => {
+      if (prev) return prev; // already set — keep it
+      // Fetch from server (page reload / non-drawer who guessed)
+      fetch('/api/game', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'getWord', roomId, playerId: player.id }) })
+        .then(r => r.json()).then(d => { if (d.word) setSecretWord(d.word); }).catch(() => {});
+      return prev;
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [room?.phase, room?.currentRound?.drawerId, player?.id, player?.hasGuessed]);
 
@@ -308,8 +313,10 @@ export default function RoomPage() {
         transitionFired.current = room.phase;
         if (room.phase === 'choosing') {
           authPhase.current = 'drawing';
-          // selectWord writes to RTDB directly — returns now instantly, no cold start
-          const serverStartedAt = await selectWord(roomId, room.wordChoices?.[0] || 'apple', room.currentRound!.drawerId, room.settings.drawTime ?? 80);
+          const chosenWord = room.wordChoices?.[0] || 'apple';
+          // If this client is the drawer, set word immediately
+          if (player.id === room.currentRound!.drawerId) setSecretWord(chosenWord);
+          const serverStartedAt = await selectWord(roomId, chosenWord, room.currentRound!.drawerId, room.settings.drawTime ?? 80);
           authStartedAt.current = serverStartedAt;
         } else if (room.phase === 'drawing') {
           authPhase.current = 'reveal';
@@ -651,6 +658,7 @@ export default function RoomPage() {
                   {room.wordChoices?.map(word => (
                     <button key={word} onClick={async () => {
                       authPhase.current = 'drawing';
+                      setSecretWord(word); // drawer knows the word immediately
                       const t = await selectWord(roomId, word, room.currentRound!.drawerId, room.settings.drawTime ?? 80);
                       authStartedAt.current = t;
                     }}
