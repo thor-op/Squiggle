@@ -4,8 +4,8 @@ import { useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { Room, RoomSettings } from '@/lib/types';
 import { Play, ChevronDown, ChevronUp } from 'lucide-react';
-import { updateDoc, doc } from 'firebase/firestore';
-import { db } from '@/lib/firebase';
+import { rtdb } from '@/lib/firebase';
+import { ref, update } from 'firebase/database';
 import Corners from '@/components/Corner';
 
 function Dropdown({ value, options, onChange }: {
@@ -63,7 +63,7 @@ export default function HostControls({ room, onStart, playerCount }: { room: Roo
   const [showCustomWords, setShowCustomWords] = useState(false);
 
   const handleSettingChange = async (key: keyof RoomSettings, value: unknown) => {
-    await updateDoc(doc(db, 'rooms', room.id), { [`settings.${key}`]: value });
+    await update(ref(rtdb, `rooms/${room.id}/settings`), { [key]: value });
   };
 
   const hints = room.settings.hints ?? 2;

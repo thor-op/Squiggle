@@ -3,8 +3,8 @@
 import { useEffect, useState, useRef } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { getPlayerId, getPlayerProfile, setPlayerProfile } from '@/lib/store';
-import { db } from '@/lib/firebase';
-import { doc, onSnapshot, collection, updateDoc, deleteDoc } from 'firebase/firestore';
+import { rtdb } from '@/lib/firebase';
+import { ref, onValue, update, remove } from 'firebase/database';
 import { Room, Player } from '@/lib/types';
 import { createOrJoinRoom, startGame, selectWord, endRound, nextTurn, sendSystemMessage } from '@/lib/gameLogic';
 import { Copy, Check, Crown, Brush, LogOut, Bug, Lightbulb, MessageSquare, X } from 'lucide-react';
@@ -147,17 +147,23 @@ export default function RoomPage() {
 
   useEffect(() => {
     if (!player) return;
-    const cleanup = () => deleteDoc(doc(db, `rooms/${roomId}/players`, player.id)).catch(() => {});
+    const cleanup = () => remove(ref(rtdb, `players/${roomId}/${player.id}`)).catch(() => {});
     window.addEventListener('beforeunload', cleanup);
     return () => window.removeEventListener('beforeunload', cleanup);
   }, [player, roomId]);
 
   useEffect(() => {
     if (!roomId || isInitializing) return;
-    return onSnapshot(doc(db, 'rooms', roomId), (d) => {
-      if (d.exists()) {
+    const roomDbRef = ref(rtdb, `rooms/${roomId}`);
+    const unsub = onValue(roomDbRef, (snap) => {
+      if (snap.exists()) {
         setRoomNotFound(false);
-        const nr = { id: d.id, ...d.data() } as Room;
+        const data = snap.val();
+        // RTDB stores categories as object keys — normalize to array
+        if (data.settings?.categories && !Array.isArray(data.settings.categories)) {
+          data.settings.categories = Object.keys(data.settings.categories);
+        }
+        const nr = { id: roomId, ...data } as Room;
         setRoom(prev => {
           if (prev && prev.phase !== nr.phase) {
             if (nr.phase === 'reveal') playSound('endRound');
@@ -167,16 +173,20 @@ export default function RoomPage() {
         });
       } else { setRoomNotFound(true); }
     });
+    return () => unsub();
   }, [roomId, isInitializing]);
 
   const hasSeenPlayers = useRef(false);
   useEffect(() => {
     if (!roomId) return;
-    return onSnapshot(collection(db, `rooms/${roomId}/players`), (snap) => {
+    const playersDbRef = ref(rtdb, `players/${roomId}`);
+    const unsub = onValue(playersDbRef, (snap) => {
       const p: Player[] = [];
-      snap.forEach(d => p.push({ id: d.id, ...d.data() } as Player));
+      if (snap.exists()) {
+        snap.forEach(child => { p.push({ id: child.key!, ...child.val() } as Player); return false; });
+      }
       p.sort((a, b) => b.score - a.score);
-      if (snap.size === 0) {
+      if (p.length === 0) {
         if (hasSeenPlayers.current) {
           fetch('/api/game', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'deleteRoom', roomId }) }).catch(() => {});
         }
@@ -198,6 +208,7 @@ export default function RoomPage() {
         if (me && me.isHost !== player.isHost) setPlayer(me);
       }
     });
+    return () => unsub();
   }, [roomId, player]);
 
   useEffect(() => {
@@ -212,17 +223,41 @@ export default function RoomPage() {
   const revealedHints = useRef<Set<number>>(new Set());
   const lastRoundId = useRef<string>('');
   const transitionFired = useRef<string>('');
+  // Optimistic startedAt: set locally when we trigger selectWord so timer doesn't wait for snapshot
+  const localStartedAt = useRef<number | null>(null);
+  const localPhase = useRef<string>('');
+  // Always-fresh refs so the interval closure never reads stale state
+  const roomRef = useRef<Room | null>(null);
+  const playersRef = useRef<Player[]>([]);
+  const playerRef = useRef<Player | null>(null);
+  roomRef.current = room;
+  playersRef.current = players;
+  playerRef.current = player;
 
   useEffect(() => {
-    if (!room) return;
     const iv = setInterval(async () => {
-      if (!room.currentRound) return;
-      const elapsed = (Date.now() - room.currentRound.startedAt) / 1000;
+      const room = roomRef.current;
+      const players = playersRef.current;
+      const player = playerRef.current;
+      if (!room?.currentRound) return;
+
+      // Use optimistic local startedAt if we just triggered a phase change, else use Firestore value
+      const startedAt = (localPhase.current === room.phase && localStartedAt.current)
+        ? localStartedAt.current
+        : room.currentRound.startedAt;
+
+      const elapsed = (Date.now() - startedAt) / 1000;
       const rem = Math.max(0, Math.ceil(room.currentRound.timeLimit - elapsed));
       setTimeLeft(prev => { if (room.phase === 'drawing' && rem <= 10 && rem > 0 && rem !== prev) playSound('tick'); return rem; });
 
       const roundKey = `${room.currentRound.drawerId}-${room.currentRound.roundNumber}-${room.phase}`;
-      if (roundKey !== lastRoundId.current) { lastRoundId.current = roundKey; revealedHints.current = new Set(); transitionFired.current = ''; }
+      if (roundKey !== lastRoundId.current) {
+        lastRoundId.current = roundKey;
+        revealedHints.current = new Set();
+        transitionFired.current = '';
+        // Clear optimistic ref when Firestore confirms the new phase
+        if (localPhase.current === room.phase) { localStartedAt.current = null; localPhase.current = ''; }
+      }
 
       if (!player?.isHost) return;
 
@@ -242,13 +277,23 @@ export default function RoomPage() {
       const shouldTransition = rem <= 0 || (room.phase === 'drawing' && (allGuessed || skipVotes > guessers.length / 2));
       if (shouldTransition && transitionFired.current !== room.phase) {
         transitionFired.current = room.phase;
-        if (room.phase === 'choosing') selectWord(roomId, room.wordChoices?.[0] || 'apple', room.currentRound!.drawerId, room.settings.drawTime ?? 80);
-        else if (room.phase === 'drawing') endRound(roomId);
-        else if (room.phase === 'reveal') nextTurn(roomId, room, players);
+        // Record optimistic startedAt before the async API call so timer resets immediately
+        localStartedAt.current = Date.now();
+        if (room.phase === 'choosing') {
+          localPhase.current = 'drawing';
+          selectWord(roomId, room.wordChoices?.[0] || 'apple', room.currentRound!.drawerId, room.settings.drawTime ?? 80);
+        } else if (room.phase === 'drawing') {
+          localPhase.current = 'reveal';
+          endRound(roomId);
+        } else if (room.phase === 'reveal') {
+          localPhase.current = 'choosing';
+          nextTurn(roomId, room, players);
+        }
       }
     }, 1000);
     return () => clearInterval(iv);
-  }, [room, player, roomId, secretWord, players]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId]);
 
   // ── NAME DIALOG ────────────────────────────────────────────────────────────
   if (showNameDialog) {
@@ -300,9 +345,9 @@ export default function RoomPage() {
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
-  const handleVoteSkip = async () => { if (isDrawer) return; await updateDoc(doc(db, 'rooms', roomId), { [`votes.skip.${player.id}`]: true }); };
-  const handleReaction = async (emoji: string) => { await updateDoc(doc(db, 'rooms', roomId), { [`reactions.${player.id}`]: { emoji, timestamp: Date.now() } }); };
-  const handleLeave = async () => { await deleteDoc(doc(db, `rooms/${roomId}/players`, player.id)); router.push('/'); };
+  const handleVoteSkip = async () => { if (isDrawer) return; await update(ref(rtdb, `rooms/${roomId}/votes/skip`), { [player.id]: true }); };
+  const handleReaction = async (emoji: string) => { await update(ref(rtdb, `rooms/${roomId}/reactions`), { [player.id]: { emoji, timestamp: Date.now() } }); };
+  const handleLeave = async () => { await remove(ref(rtdb, `players/${roomId}/${player.id}`)); router.push('/'); };
 
   // Draggable bottom sheet — DOM-direct, zero re-renders during drag
   const onDragStart = (e: React.PointerEvent) => {
@@ -700,7 +745,7 @@ export default function RoomPage() {
           <div className="flex items-center gap-3">
             <div className="relative">
               <Corners size={5} weight={1} color="text-zinc-500" />
-              <button onClick={() => player.isHost && updateDoc(doc(db, 'rooms', roomId), { phase: 'lobby' })} disabled={!player.isHost}
+              <button onClick={() => player.isHost && update(ref(rtdb, `rooms/${roomId}`), { phase: 'lobby' })} disabled={!player.isHost}
                 className="bg-white text-black px-6 sm:px-8 py-3 font-bold text-xs uppercase tracking-widest hover:bg-zinc-200 active:scale-[0.98] transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                 title={player.isHost ? undefined : 'Waiting for host...'}>
                 {player.isHost ? 'Play Again' : 'Waiting for host...'}

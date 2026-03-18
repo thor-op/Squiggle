@@ -1,8 +1,8 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
-import { db } from '@/lib/firebase';
-import { collection, query, orderBy, limit, onSnapshot } from 'firebase/firestore';
+import { rtdb } from '@/lib/firebase';
+import { ref, query, orderByChild, limitToLast, onValue } from 'firebase/database';
 import { ChatMessage, Player } from '@/lib/types';
 import { sendChatMessage } from '@/lib/gameLogic';
 import { Send, MessageSquare } from 'lucide-react';
@@ -57,21 +57,21 @@ export default function Chat({
   const avatarMap = Object.fromEntries(players.map(p => [p.id, p.avatarId]));
 
   useEffect(() => {
-    const q = query(
-      collection(db, `rooms/${roomId}/chat`),
-      orderBy('timestamp', 'desc'),
-      limit(60)
+    const chatRef = query(
+      ref(rtdb, `chat/${roomId}`),
+      orderByChild('timestamp'),
+      limitToLast(60)
     );
-    const unsub = onSnapshot(q, (snapshot) => {
+    const unsub = onValue(chatRef, (snapshot) => {
       const msgs: ChatMessage[] = [];
-      snapshot.forEach(d => msgs.push({ id: d.id, ...d.data() } as ChatMessage));
-      const reversed = msgs.reverse();
+      snapshot.forEach(child => { msgs.push({ id: child.key!, ...child.val() } as ChatMessage); return false; });
+      // already in ascending order from orderByChild
       setMessages(prev => {
-        if (prev.length > 0 && reversed.length > prev.length) {
-          const newMsg = reversed[reversed.length - 1];
+        if (prev.length > 0 && msgs.length > prev.length) {
+          const newMsg = msgs[msgs.length - 1];
           if (newMsg.isCorrect && !newMsg.isSystem) playSound('correct');
         }
-        return reversed;
+        return msgs;
       });
     });
     return () => unsub();

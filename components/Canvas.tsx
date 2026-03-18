@@ -1,8 +1,8 @@
 'use client';
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { db } from '@/lib/firebase';
-import { doc, onSnapshot, updateDoc, getDoc } from 'firebase/firestore';
+import { rtdb } from '@/lib/firebase';
+import { ref, onValue, update, get } from 'firebase/database';
 import { CanvasState, Stroke } from '@/lib/types';
 import { Eraser, Pen, RotateCcw, Trash2, Palette, Circle, Square, Minus, PaintBucket } from 'lucide-react';
 
@@ -152,7 +152,6 @@ export default function Canvas({ roomId, isDrawer }: { roomId: string; isDrawer:
   const lastFirestoreUpdateRef = useRef(0);
   const rafRef = useRef<number | null>(null);
 
-  const [canvasState, setCanvasState] = useState<CanvasState | null>(null);
   const canvasStateRef = useRef<CanvasState | null>(null);
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -215,12 +214,12 @@ export default function Canvas({ roomId, isDrawer }: { roomId: string; isDrawer:
     return () => ro.disconnect();
   }, [resizeAll]);
 
-  // ── Firestore listener ────────────────────────────────────────────────────
+  // ── RTDB listener ─────────────────────────────────────────────────────────
   useEffect(() => {
-    const unsub = onSnapshot(doc(db, `rooms/${roomId}/canvas/main`), snap => {
+    const canvasRef2 = ref(rtdb, `canvas/${roomId}`);
+    const unsub = onValue(canvasRef2, snap => {
       if (!snap.exists()) return;
-      const state = snap.data() as CanvasState;
-      setCanvasState(state);
+      const state = snap.val() as CanvasState;
       canvasStateRef.current = state;
       fullRedraw(state);
     });
@@ -319,12 +318,12 @@ export default function Canvas({ roomId, isDrawer }: { roomId: string; isDrawer:
       if (!ctx) return;
       floodFill(ctx, coords.x, coords.y, color);
       const fillStroke: Stroke = { tool: 'fill', color, size, points: [coords] };
-      getDoc(doc(db, `rooms/${roomId}/canvas/main`)).then(snap => {
+      get(ref(rtdb, `canvas/${roomId}`)).then(snap => {
         if (!snap.exists()) return;
-        const data = snap.data() as CanvasState;
+        const data = snap.val() as CanvasState;
         const completed: Stroke[] = JSON.parse(data.completedStrokes || '[]');
         completed.push(fillStroke);
-        updateDoc(doc(db, `rooms/${roomId}/canvas/main`), {
+        update(ref(rtdb, `canvas/${roomId}`), {
           completedStrokes: JSON.stringify(completed), activeStroke: null, lastUpdate: Date.now(),
         });
       });
@@ -354,13 +353,13 @@ export default function Canvas({ roomId, isDrawer }: { roomId: string; isDrawer:
       currentStrokeRef.current.points.push(coords);
     }
 
-    // Throttle Firestore sync to 80ms via rAF
+    // Throttle RTDB sync to 80ms via rAF
     if (rafRef.current) return;
     rafRef.current = requestAnimationFrame(() => {
       rafRef.current = null;
       const now = Date.now();
       if (now - lastFirestoreUpdateRef.current > 80 && currentStrokeRef.current) {
-        updateDoc(doc(db, `rooms/${roomId}/canvas/main`), {
+        update(ref(rtdb, `canvas/${roomId}`), {
           activeStroke: JSON.stringify(currentStrokeRef.current),
           lastUpdate: now,
         });
@@ -392,12 +391,12 @@ export default function Canvas({ roomId, isDrawer }: { roomId: string; isDrawer:
     const ctx = getCtx(canvasRef);
     if (ctx) applyStroke(ctx, finalStroke);
 
-    const snap = await getDoc(doc(db, `rooms/${roomId}/canvas/main`));
+    const snap = await get(ref(rtdb, `canvas/${roomId}`));
     if (snap.exists()) {
-      const data = snap.data() as CanvasState;
+      const data = snap.val() as CanvasState;
       const completed: Stroke[] = JSON.parse(data.completedStrokes || '[]');
       completed.push(finalStroke);
-      await updateDoc(doc(db, `rooms/${roomId}/canvas/main`), {
+      await update(ref(rtdb, `canvas/${roomId}`), {
         completedStrokes: JSON.stringify(completed), activeStroke: null, lastUpdate: Date.now(),
       });
     }
@@ -406,20 +405,20 @@ export default function Canvas({ roomId, isDrawer }: { roomId: string; isDrawer:
   // ── Undo / Clear ──────────────────────────────────────────────────────────
   const handleUndo = async () => {
     if (!isDrawer) return;
-    const snap = await getDoc(doc(db, `rooms/${roomId}/canvas/main`));
+    const snap = await get(ref(rtdb, `canvas/${roomId}`));
     if (!snap.exists()) return;
-    const data = snap.data() as CanvasState;
+    const data = snap.val() as CanvasState;
     const completed: Stroke[] = JSON.parse(data.completedStrokes || '[]');
     if (!completed.length) return;
     completed.pop();
-    await updateDoc(doc(db, `rooms/${roomId}/canvas/main`), {
+    await update(ref(rtdb, `canvas/${roomId}`), {
       completedStrokes: JSON.stringify(completed), lastUpdate: Date.now(),
     });
   };
 
   const handleClear = async () => {
     if (!isDrawer) return;
-    await updateDoc(doc(db, `rooms/${roomId}/canvas/main`), {
+    await update(ref(rtdb, `canvas/${roomId}`), {
       completedStrokes: '[]', activeStroke: null, clearedAt: Date.now(), lastUpdate: Date.now(),
     });
   };

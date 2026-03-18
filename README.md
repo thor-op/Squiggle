@@ -13,7 +13,7 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL%20v3-white?style=flat-square&labelColor=09090b)](./LICENSE)
 [![Next.js](https://img.shields.io/badge/Next.js-15-white?style=flat-square&labelColor=09090b&logo=next.js)](https://nextjs.org)
-[![Firebase](https://img.shields.io/badge/Firebase-Firestore-white?style=flat-square&labelColor=09090b&logo=firebase)](https://firebase.google.com)
+[![Firebase](https://img.shields.io/badge/Realtime%20Database-RTDB-white?style=flat-square&labelColor=09090b&logo=firebase)](https://firebase.google.com)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5-white?style=flat-square&labelColor=09090b&logo=typescript)](https://typescriptlang.org)
 
 </div>
@@ -28,14 +28,14 @@ The word bank lives entirely server-side — players can't cheat by reading the 
 
 ## features
 
-- real-time canvas synced across all players
+- real-time canvas synced across all players via Firebase Realtime Database
 - private rooms with a 6-character shareable code
 - host controls — rounds, draw time, hints, word count, max players, categories
 - custom word support per room
 - score system with guess-order bonuses and drawer rewards
 - progressive hints that reveal letters over time
 - emoji reactions, vote-to-skip, live chat
-- word bank stored in firestore, fetched server-side only
+- word bank stored in Firestore, fetched server-side only — never in the client bundle
 
 ---
 
@@ -44,7 +44,8 @@ The word bank lives entirely server-side — players can't cheat by reading the 
 | | |
 |---|---|
 | framework | Next.js 15 (App Router) |
-| database | Firebase Firestore |
+| realtime | Firebase Realtime Database |
+| word bank | Firebase Firestore (server-side only) |
 | server | Firebase Admin SDK |
 | styling | Tailwind CSS v4 |
 | language | TypeScript 5 |
@@ -64,8 +65,9 @@ npm install
 ### 2. firebase setup
 
 1. Create a project at [console.firebase.google.com](https://console.firebase.google.com)
-2. Enable **Firestore** in Native mode
-3. Go to **Project Settings → Service Accounts → Generate new private key**
+2. Enable **Realtime Database**
+3. Enable **Firestore** in Native mode (for the word bank)
+4. Go to **Project Settings → Service Accounts → Generate new private key**
 
 ### 3. environment variables
 
@@ -73,19 +75,21 @@ npm install
 cp .env.example .env.local
 ```
 
-Fill in `.env.local` with your Firebase client config and Admin SDK credentials.
+Fill in `.env.local` with your Firebase client config and Admin SDK credentials. Make sure `NEXT_PUBLIC_FIREBASE_DATABASE_URL` is set — it's the RTDB URL from your Firebase console.
 
-### 4. deploy firestore rules
+### 4. deploy rules
 
 ```bash
 npx firebase login
 npx firebase use your-project-id
-npx firebase deploy --only firestore:rules
+
+# deploy both RTDB and Firestore rules
+npx firebase deploy --only database,firestore:rules
 ```
 
 ### 5. seed the word bank
 
-Words live in Firestore, not in the client bundle. Copy the example and fill in your words:
+Words live in Firestore (server-side only), not in the client bundle. Copy the example and fill in your words:
 
 ```bash
 cp scripts/seed-words.example.ts scripts/seed-words.ts
@@ -114,15 +118,15 @@ app/
 └── page.tsx                landing page
 
 components/
-├── Canvas.tsx              drawing canvas
-├── Chat.tsx                chat + guess input
+├── Canvas.tsx              drawing canvas (RTDB synced)
+├── Chat.tsx                chat + guess input (RTDB synced)
 ├── HostControls.tsx        lobby settings
 ├── FloatingEmojis.tsx      emoji reactions
 └── RoomDoodles.tsx         decorative background
 
 lib/
-├── firebase.ts             client firestore instance
-├── firebaseAdmin.ts        admin sdk init
+├── firebase.ts             RTDB client instance
+├── firebaseAdmin.ts        admin SDK init (RTDB + Firestore)
 ├── gameLogic.ts            room creation, turns, chat
 ├── words.ts                getWordMask utility only
 ├── sounds.ts               web audio sound effects
@@ -133,6 +137,16 @@ scripts/
 ├── seed-words.example.ts   template — copy and fill in your words
 └── seed-words.ts           your actual word bank (gitignored)
 ```
+
+---
+
+## data architecture
+
+| data | where | why |
+|---|---|---|
+| rooms, players, chat, canvas | Firebase Realtime Database | low-latency, push-based sync |
+| word bank | Firestore (admin-only) | server-side only, clients blocked by rules |
+| secret word (active round) | server memory + Firestore secrets | never exposed to clients |
 
 ---
 

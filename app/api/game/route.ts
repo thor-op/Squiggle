@@ -1,83 +1,65 @@
 /**
- * Server-side game API — the secret word NEVER touches Firestore or the client directly.
- * Word is stored in server memory (Map) keyed by roomId.
- * All guess validation happens here.
+ * Server-side game API — secret word never touches client.
+ * Room/player/chat/canvas data lives in Firebase Realtime Database.
+ * Word bank stays in Firestore (admin-only).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getFirestore } from 'firebase-admin/firestore';
-import { initAdminApp } from '@/lib/firebaseAdmin';
+import { getAdminDb, initAdminApp } from '@/lib/firebaseAdmin';
 import { getWordMask } from '@/lib/words';
 import { revealHintLetter } from '@/lib/gameLogic';
 
-/** Fetch random words from Firestore wordBank — never exposed to clients */
+/** Fetch random words from Firestore wordBank */
 async function getRandomWordsFromDB(
-  db: FirebaseFirestore.Firestore,
+  fsDb: FirebaseFirestore.Firestore,
   categories: string[],
   customWordsStr: string = '',
   count: number = 3
 ): Promise<string[]> {
   let pool: { word: string; difficulty: string }[] = [];
-
   const cats = categories.length > 0 ? categories : ['Animals', 'Food', 'Objects'];
   await Promise.all(
     cats.map(async (cat) => {
-      const snap = await db.doc(`wordBank/${cat}`).get();
-      if (snap.exists) {
-        const data = snap.data()!;
-        pool = pool.concat(data.words ?? []);
-      }
+      const snap = await fsDb.doc(`wordBank/${cat}`).get();
+      if (snap.exists) pool = pool.concat(snap.data()!.words ?? []);
     })
   );
-
   if (customWordsStr) {
     customWordsStr.split(',').map(w => w.trim()).filter(Boolean).forEach(w => {
       pool.push({ word: w.toLowerCase(), difficulty: 'custom' });
     });
   }
-
   if (pool.length === 0) return ['apple', 'banana', 'cat'];
-  const shuffled = [...pool].sort(() => 0.5 - Math.random());
-  return shuffled.slice(0, count).map(w => w.word);
+  return [...pool].sort(() => 0.5 - Math.random()).slice(0, count).map(w => w.word);
 }
 
-// In-memory word store: roomId → { word, drawerId, startedAt, hintsRevealed, totalGuessElapsed, wrongGuesses }
-// NOTE: this resets on server restart (cold start). For production use Redis/KV.
+// In-memory word store (resets on cold start — acceptable for game sessions)
 const wordStore = new Map<string, {
   word: string;
   drawerId: string;
   startedAt: number;
   hintsRevealed: number;
   currentMask: string;
-  drawTime: number;          // total draw time in seconds
-  totalGuessElapsed: number; // sum of elapsed seconds for each correct guess (for drawer speed bonus)
-  wrongGuesses: Record<string, number>; // playerId → wrong guess count
+  drawTime: number;
+  totalGuessElapsed: number;
+  wrongGuesses: Record<string, number>;
 }>();
 
-function getDb() {
-  initAdminApp();
-  return getFirestore();
-}
-
-/** Rehydrate wordStore from Firestore if the in-memory map was wiped (cold start / dev HMR) */
 async function getEntry(roomId: string) {
   let entry = wordStore.get(roomId);
   if (entry) return entry;
-
-  const db = getDb();
-  const snap = await db.doc(`rooms/${roomId}/secrets/word`).get();
-  if (!snap.exists) return null;
-  const data = snap.data()!;
-
-  // Also grab current mask from room doc (hints may have been revealed)
-  const roomSnap = await db.doc(`rooms/${roomId}`).get();
-  const currentMask = roomSnap.exists ? (roomSnap.data()!.currentRound?.wordMask ?? data.mask) : data.mask;
-
+  // Rehydrate from RTDB secrets on cold start
+  const db = getAdminDb();
+  const snap = await db.ref(`secrets/${roomId}/word`).get();
+  if (!snap.exists()) return null;
+  const data = snap.val();
+  const roomSnap = await db.ref(`rooms/${roomId}/currentRound/wordMask`).get();
   entry = {
     word: data.value,
     drawerId: data.drawerId,
     startedAt: Date.now(),
     hintsRevealed: 0,
-    currentMask,
+    currentMask: roomSnap.exists() ? roomSnap.val() : data.mask,
     drawTime: 80,
     totalGuessElapsed: 0,
     wrongGuesses: {},
@@ -92,30 +74,36 @@ export async function POST(req: NextRequest) {
 
   if (action === 'getWordChoices') {
     const { categories, customWords, wordCount } = body;
-    const db = getDb();
-    const choices = await getRandomWordsFromDB(db, categories ?? [], customWords ?? '', wordCount ?? 3);
+    initAdminApp();
+    const fsDb = getFirestore();
+    const choices = await getRandomWordsFromDB(fsDb, categories ?? [], customWords ?? '', wordCount ?? 3);
     return NextResponse.json({ choices });
   }
 
   if (action === 'deleteRoom') {
     const { roomId } = body;
     if (!roomId) return NextResponse.json({ error: 'missing roomId' }, { status: 400 });
-    const db = getDb();
-    // recursiveDelete removes the doc + all subcollections (canvas, chat, players, secrets)
-    await db.recursiveDelete(db.doc(`rooms/${roomId}`));
+    const db = getAdminDb();
+    await Promise.all([
+      db.ref(`rooms/${roomId}`).remove(),
+      db.ref(`players/${roomId}`).remove(),
+      db.ref(`chat/${roomId}`).remove(),
+      db.ref(`canvas/${roomId}`).remove(),
+      db.ref(`secrets/${roomId}`).remove(),
+    ]);
     wordStore.delete(roomId);
     return NextResponse.json({ ok: true });
   }
 
   if (action === 'selectWord') {
-    // Called by host when drawer picks a word
     const { roomId, word, drawerId, drawTime } = body;
     if (!roomId || !word || !drawerId) return NextResponse.json({ error: 'missing fields' }, { status: 400 });
 
     const mask = getWordMask(word);
+    const now = Date.now();
     wordStore.set(roomId, {
       word, drawerId,
-      startedAt: Date.now(),
+      startedAt: now,
       hintsRevealed: 0,
       currentMask: mask,
       drawTime: drawTime ?? 80,
@@ -123,37 +111,35 @@ export async function POST(req: NextRequest) {
       wrongGuesses: {},
     });
 
-    const db = getDb();
-    // Store word server-side in secrets (admin-only, client rules block reads)
-    await db.doc(`rooms/${roomId}/secrets/word`).set({ value: word, drawerId, mask });
-    await db.doc(`rooms/${roomId}`).update({
-      phase: 'drawing',
-      wordChoices: [],
-      'currentRound.wordMask': mask,
-      'currentRound.wordLength': word.length,
-      'currentRound.startedAt': Date.now(),
-      'currentRound.timeLimit': drawTime ?? 80,
-      'currentRound.guessCount': 0,
-      lastActive: Date.now(),
-    });
-    await db.doc(`rooms/${roomId}/canvas/main`).update({
-      completedStrokes: '[]', activeStroke: null, clearedAt: Date.now(), lastUpdate: Date.now(),
-    });
+    const db = getAdminDb();
+    await Promise.all([
+      db.ref(`secrets/${roomId}/word`).set({ value: word, drawerId, mask }),
+      db.ref(`rooms/${roomId}`).update({
+        phase: 'drawing',
+        wordChoices: null,
+        'currentRound/wordMask': mask,
+        'currentRound/wordLength': word.length,
+        'currentRound/startedAt': now,
+        'currentRound/timeLimit': drawTime ?? 80,
+        'currentRound/guessCount': 0,
+        lastActive: now,
+      }),
+      db.ref(`canvas/${roomId}`).set({
+        completedStrokes: '[]', activeStroke: null, clearedAt: now, lastUpdate: now,
+      }),
+    ]);
 
-    return NextResponse.json({ ok: true, mask });
+    return NextResponse.json({ ok: true, mask, startedAt: now });
   }
 
   if (action === 'getWord') {
-    // Drawer can always fetch. Guessers can fetch only after they've guessed correctly.
     const { roomId, playerId } = body;
     const entry = await getEntry(roomId);
     if (!entry) return NextResponse.json({ word: null });
     if (entry.drawerId !== playerId) {
-      const db = getDb();
-      const playerSnap = await db.doc(`rooms/${roomId}/players/${playerId}`).get();
-      if (!playerSnap.exists || !playerSnap.data()!.hasGuessed) {
-        return NextResponse.json({ error: 'not the drawer' }, { status: 403 });
-      }
+      const db = getAdminDb();
+      const snap = await db.ref(`players/${roomId}/${playerId}/hasGuessed`).get();
+      if (!snap.exists() || !snap.val()) return NextResponse.json({ error: 'not the drawer' }, { status: 403 });
     }
     return NextResponse.json({ word: entry.word });
   }
@@ -168,92 +154,79 @@ export async function POST(req: NextRequest) {
     const correct = guess.trim().toLowerCase() === entry.word.toLowerCase();
 
     if (!correct) {
-      // Wrong guess penalty: -2 points, tracked server-side
       entry.wrongGuesses[playerId] = (entry.wrongGuesses[playerId] ?? 0) + 1;
-      const db = getDb();
-      const playerSnap = await db.doc(`rooms/${roomId}/players/${playerId}`).get();
-      if (playerSnap.exists && !playerSnap.data()!.hasGuessed) {
-        const currentScore = playerSnap.data()!.score || 0;
-        await db.doc(`rooms/${roomId}/players/${playerId}`).update({
-          score: Math.max(0, currentScore - 2),
-        });
+      const db = getAdminDb();
+      const scoreSnap = await db.ref(`players/${roomId}/${playerId}`).get();
+      if (scoreSnap.exists() && !scoreSnap.val().hasGuessed) {
+        const cur = scoreSnap.val().score || 0;
+        await db.ref(`players/${roomId}/${playerId}/score`).set(Math.max(0, cur - 2));
       }
       return NextResponse.json({ correct: false });
     }
 
-    const db = getDb();
-    const [playerSnap, roomSnap] = await Promise.all([
-      db.doc(`rooms/${roomId}/players/${playerId}`).get(),
-      db.doc(`rooms/${roomId}`).get(),
+    const db = getAdminDb();
+    const [playerSnap, guessCountSnap] = await Promise.all([
+      db.ref(`players/${roomId}/${playerId}`).get(),
+      db.ref(`rooms/${roomId}/currentRound/guessCount`).get(),
     ]);
 
-    const freshPlayer = playerSnap.exists ? playerSnap.data()! : null;
+    const freshPlayer = playerSnap.exists() ? playerSnap.val() : null;
     if (!freshPlayer || freshPlayer.hasGuessed) return NextResponse.json({ correct: false, reason: 'already guessed' });
 
-    const roomData = roomSnap.exists ? roomSnap.data()! : null;
-    const guessCount: number = roomData?.currentRound?.guessCount ?? 0;
-    const guessOrder = guessCount + 1;
+    const guessOrder = (guessCountSnap.exists() ? guessCountSnap.val() : 0) + 1;
     const totalTime = entry.drawTime;
     const elapsed = (Date.now() - entry.startedAt) / 1000;
     const timeLeft = Math.max(0, totalTime - elapsed);
 
-    // Points = 120 × (timeLeft / totalTime) ^ 1.5
     let points = Math.round(120 * Math.pow(timeLeft / totalTime, 1.5));
-    points = Math.max(10, points); // floor so late guesses still get something
-
-    // Order bonus
+    points = Math.max(10, points);
     if (guessOrder === 1) points += 20;
     else if (guessOrder === 2) points += 10;
     else if (guessOrder === 3) points += 5;
-
-    // Hint penalty: -20% per hint revealed
-    if (entry.hintsRevealed > 0) {
-      points = Math.round(points * Math.pow(0.8, entry.hintsRevealed));
-    }
-
+    if (entry.hintsRevealed > 0) points = Math.round(points * Math.pow(0.8, entry.hintsRevealed));
     points = Math.max(5, points);
 
-    // Track elapsed for drawer speed bonus
     entry.totalGuessElapsed += elapsed;
 
-    const msgRef = db.collection(`rooms/${roomId}/chat`).doc();
-    await msgRef.set({
-      text: `${playerName} guessed the word!`,
-      senderId: playerId, senderName: playerName,
-      isSystem: false, isCorrect: true, isGuessOnly: false,
-      guessOrder, pointsEarned: points, roundTimestamp: Math.floor(elapsed), timestamp: Date.now(),
-    });
+    const msgKey = db.ref(`chat/${roomId}`).push().key!;
+    const drawerIdVal = (await db.ref(`rooms/${roomId}/currentRound/drawerId`).get()).val();
 
-    await db.doc(`rooms/${roomId}/players/${playerId}`).update({
-      hasGuessed: true,
-      score: (freshPlayer.score || 0) + points,
-      streak: (freshPlayer.streak || 0) + 1,
-    });
-    await db.doc(`rooms/${roomId}`).update({ 'currentRound.guessCount': guessOrder });
+    const updates: Record<string, unknown> = {
+      [`chat/${roomId}/${msgKey}`]: {
+        text: `${playerName} guessed the word!`,
+        senderId: playerId, senderName: playerName,
+        isSystem: false, isCorrect: true, isGuessOnly: false,
+        guessOrder, pointsEarned: points,
+        roundTimestamp: Math.floor(elapsed), timestamp: Date.now(),
+      },
+      [`players/${roomId}/${playerId}/hasGuessed`]: true,
+      [`players/${roomId}/${playerId}/score`]: (freshPlayer.score || 0) + points,
+      [`players/${roomId}/${playerId}/streak`]: (freshPlayer.streak || 0) + 1,
+      [`rooms/${roomId}/currentRound/guessCount`]: guessOrder,
+    };
 
-    // Drawer: +25 per correct guess + speed bonus
-    const drawerId = roomData?.currentRound?.drawerId;
-    if (drawerId && drawerId !== playerId) {
-      const drawerSnap = await db.doc(`rooms/${roomId}/players/${drawerId}`).get();
-      if (drawerSnap.exists) {
-        // Speed bonus: up to +15 if guessed in first 25% of time
+    // Drawer gets +25 per correct guess + speed bonus
+    if (drawerIdVal && drawerIdVal !== playerId) {
+      const drawerSnap = await db.ref(`players/${roomId}/${drawerIdVal}`).get();
+      if (drawerSnap.exists()) {
         const speedBonus = timeLeft / totalTime >= 0.75 ? 15 : timeLeft / totalTime >= 0.5 ? 8 : 0;
-        await db.doc(`rooms/${roomId}/players/${drawerId}`).update({
-          score: (drawerSnap.data()!.score || 0) + 25 + speedBonus,
-        });
+        updates[`players/${roomId}/${drawerIdVal}/score`] = (drawerSnap.val().score || 0) + 25 + speedBonus;
       }
     }
 
-    // Check if all non-drawer players have now guessed → +50 all-guessed bonus for drawer
-    const allPlayersSnap = await db.collection(`rooms/${roomId}/players`).get();
-    const nonDrawers = allPlayersSnap.docs.filter(d => d.id !== drawerId);
-    const allGuessed = nonDrawers.length > 0 && nonDrawers.every(d => d.id === playerId || d.data().hasGuessed);
-    if (allGuessed && drawerId) {
-      const drawerSnap = await db.doc(`rooms/${roomId}/players/${drawerId}`).get();
-      if (drawerSnap.exists) {
-        await db.doc(`rooms/${roomId}/players/${drawerId}`).update({
-          score: (drawerSnap.data()!.score || 0) + 50,
-        });
+    await db.ref().update(updates);
+
+    // Check all-guessed bonus for drawer
+    const allPlayersSnap = await db.ref(`players/${roomId}`).get();
+    if (allPlayersSnap.exists()) {
+      const allPlayers = allPlayersSnap.val() as Record<string, { hasGuessed: boolean; score: number }>;
+      const nonDrawers = Object.entries(allPlayers).filter(([id]) => id !== drawerIdVal);
+      const allGuessed = nonDrawers.length > 0 && nonDrawers.every(([id, p]) => id === playerId || p.hasGuessed);
+      if (allGuessed && drawerIdVal) {
+        const drawerSnap = await db.ref(`players/${roomId}/${drawerIdVal}`).get();
+        if (drawerSnap.exists()) {
+          await db.ref(`players/${roomId}/${drawerIdVal}/score`).set((drawerSnap.val().score || 0) + 50);
+        }
       }
     }
 
@@ -270,8 +243,8 @@ export async function POST(req: NextRequest) {
     entry.currentMask = newMask;
     entry.hintsRevealed = hintIndex;
 
-    const db = getDb();
-    await db.doc(`rooms/${roomId}`).update({ 'currentRound.wordMask': newMask });
+    const db = getAdminDb();
+    await db.ref(`rooms/${roomId}/currentRound/wordMask`).set(newMask);
     return NextResponse.json({ mask: newMask });
   }
 
@@ -279,33 +252,33 @@ export async function POST(req: NextRequest) {
     const { roomId } = body;
     const entry = await getEntry(roomId);
     const word = entry?.word ?? 'unknown';
+    const now = Date.now();
 
-    // If no one guessed, give drawer minimal consolation points (0–10)
     if (entry) {
-      const db = getDb();
-      const roomSnap = await db.doc(`rooms/${roomId}`).get();
-      const guessCount = roomSnap.exists ? (roomSnap.data()!.currentRound?.guessCount ?? 0) : 0;
+      const db = getAdminDb();
+      const guessCountSnap = await db.ref(`rooms/${roomId}/currentRound/guessCount`).get();
+      const guessCount = guessCountSnap.exists() ? guessCountSnap.val() : 0;
       if (guessCount === 0 && entry.drawerId) {
-        const drawerSnap = await db.doc(`rooms/${roomId}/players/${entry.drawerId}`).get();
-        if (drawerSnap.exists) {
-          await db.doc(`rooms/${roomId}/players/${entry.drawerId}`).update({
-            score: (drawerSnap.data()!.score || 0) + 5,
-          });
+        const drawerSnap = await db.ref(`players/${roomId}/${entry.drawerId}`).get();
+        if (drawerSnap.exists()) {
+          await db.ref(`players/${roomId}/${entry.drawerId}/score`).set((drawerSnap.val().score || 0) + 5);
         }
       }
     }
 
     wordStore.delete(roomId);
-
-    const db = getDb();
-    await db.doc(`rooms/${roomId}/secrets/word`).delete().catch(() => {});
-    await db.doc(`rooms/${roomId}`).update({
-      phase: 'reveal', reveal: { word },
-      votes: { skip: {} },
-      'currentRound.startedAt': Date.now(),
-      'currentRound.timeLimit': 5,
-      lastActive: Date.now(),
-    });
+    const db = getAdminDb();
+    await Promise.all([
+      db.ref(`secrets/${roomId}/word`).remove(),
+      db.ref(`rooms/${roomId}`).update({
+        phase: 'reveal',
+        'reveal/word': word,
+        'votes/skip': {},
+        'currentRound/startedAt': now,
+        'currentRound/timeLimit': 5,
+        lastActive: now,
+      }),
+    ]);
     return NextResponse.json({ ok: true, word });
   }
 

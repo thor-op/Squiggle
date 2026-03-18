@@ -1,0 +1,37 @@
+{
+  "rules": {
+    "rooms": {
+      "$roomId": {
+        ".read": true,
+        ".write": true,
+        "wordChoices": {
+          ".read": true,
+          ".write": true
+        }
+      }
+    },
+    "players": {
+      "$roomId": {
+        ".read": true,
+        ".write": true
+      }
+    },
+    "chat": {
+      "$roomId": {
+        ".read": true,
+        ".write": true,
+        ".indexOn": ["timestamp"]
+      }
+    },
+    "canvas": {
+      "$roomId": {
+        ".read": true,
+        ".write": true
+      }
+    },
+    "secrets": {
+      ".read": false,
+      ".write": false
+    }
+  }
+}

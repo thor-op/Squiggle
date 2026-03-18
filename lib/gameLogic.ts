@@ -1,5 +1,5 @@
-import { db } from './firebase';
-import { doc, setDoc, updateDoc, getDoc, collection, writeBatch } from 'firebase/firestore';
+import { rtdb } from './firebase';
+import { ref, set, update, get, push, serverTimestamp } from 'firebase/database';
 import { Room, Player, RoomSettings } from './types';
 
 async function fetchWordChoices(categories: string[], customWords: string, count: number): Promise<string[]> {
@@ -11,7 +11,6 @@ async function fetchWordChoices(categories: string[], customWords: string, count
   const data = await res.json();
   return data.choices ?? ['apple', 'banana', 'cat'];
 }
-
 
 /** Reveal one random hidden letter in the mask */
 export function revealHintLetter(word: string, currentMask: string): string {
@@ -25,11 +24,11 @@ export function revealHintLetter(word: string, currentMask: string): string {
 }
 
 export async function createOrJoinRoom(roomId: string, player: Player) {
-  const roomRef = doc(db, 'rooms', roomId);
-  const roomSnap = await getDoc(roomRef);
+  const roomRef = ref(rtdb, `rooms/${roomId}`);
+  const snap = await get(roomRef);
 
-  if (!roomSnap.exists()) {
-    await setDoc(roomRef, {
+  if (!snap.exists()) {
+    await set(roomRef, {
       hostId: player.id,
       phase: 'lobby',
       settings: {
@@ -39,14 +38,14 @@ export async function createOrJoinRoom(roomId: string, player: Player) {
         hintInterval: 20,
         wordCount: 3,
         maxPlayers: 8,
-        categories: ['Animals', 'Food', 'Objects'],
+        categories: { Animals: true, Food: true, Objects: true },
         customWords: ''
       },
       createdAt: Date.now(),
       lastActive: Date.now()
     });
 
-    await setDoc(doc(db, `rooms/${roomId}/canvas/main`), {
+    await set(ref(rtdb, `canvas/${roomId}`), {
       completedStrokes: '[]',
       activeStroke: null,
       clearedAt: 0,
@@ -54,35 +53,35 @@ export async function createOrJoinRoom(roomId: string, player: Player) {
     });
   }
 
-  const playerRef = doc(db, `rooms/${roomId}/players`, player.id);
-
-  // Enforce max players — count existing players (excluding self re-join)
-  if (roomSnap.exists()) {
-    const { getDocs, collection: col } = await import('firebase/firestore');
-    const playersSnap = await getDocs(col(db, `rooms/${roomId}/players`));
-    const maxPlayers = roomSnap.data().settings?.maxPlayers ?? 8;
-    const alreadyIn = playersSnap.docs.some(d => d.id === player.id);
-    if (!alreadyIn && playersSnap.size >= maxPlayers) {
+  // Enforce max players
+  if (snap.exists()) {
+    const roomData = snap.val();
+    const playersSnap = await get(ref(rtdb, `players/${roomId}`));
+    const maxPlayers = roomData.settings?.maxPlayers ?? 8;
+    const existing = playersSnap.exists() ? playersSnap.val() : {};
+    const alreadyIn = Object.keys(existing).includes(player.id);
+    if (!alreadyIn && Object.keys(existing).length >= maxPlayers) {
       throw new Error('Room is full');
     }
   }
 
-  await setDoc(playerRef, {
+  const roomData = snap.exists() ? snap.val() : null;
+  await set(ref(rtdb, `players/${roomId}/${player.id}`), {
     name: player.name,
     avatarId: player.avatarId,
     score: player.score || 0,
     streak: player.streak || 0,
     connected: true,
-    isHost: roomSnap.exists() ? roomSnap.data().hostId === player.id : true,
+    isHost: roomData ? roomData.hostId === player.id : true,
     hasGuessed: false
-  }, { merge: true });
+  });
 
   await sendSystemMessage(roomId, `${player.name} joined the room!`);
 }
 
 export async function sendSystemMessage(roomId: string, text: string, isCorrect = false) {
-  const msgRef = doc(collection(db, `rooms/${roomId}/chat`));
-  await setDoc(msgRef, {
+  const msgRef = push(ref(rtdb, `chat/${roomId}`));
+  await set(msgRef, {
     text,
     senderId: 'system',
     senderName: 'System',
@@ -103,8 +102,6 @@ export async function sendChatMessage(
 ) {
   if (!text.trim()) return false;
 
-  // During drawing phase, always send to server for guess validation
-  // (non-drawers don't have secretWord client-side — server checks it)
   if (isDrawing) {
     const res = await fetch('/api/game', {
       method: 'POST',
@@ -121,9 +118,8 @@ export async function sendChatMessage(
     const data = await res.json();
     if (data.correct) return true;
     if (data.reason === 'already guessed') {
-      // post as guessOnly so non-guessers can't see it
-      const msgRef = doc(collection(db, `rooms/${roomId}/chat`));
-      await setDoc(msgRef, {
+      const msgRef = push(ref(rtdb, `chat/${roomId}`));
+      await set(msgRef, {
         text: text.trim(),
         senderId: player.id,
         senderName: player.name,
@@ -135,9 +131,8 @@ export async function sendChatMessage(
       });
       return false;
     }
-    // Wrong guess — post as normal visible message
-    const msgRef = doc(collection(db, `rooms/${roomId}/chat`));
-    await setDoc(msgRef, {
+    const msgRef = push(ref(rtdb, `chat/${roomId}`));
+    await set(msgRef, {
       text: text.trim(),
       senderId: player.id,
       senderName: player.name,
@@ -150,9 +145,8 @@ export async function sendChatMessage(
     return false;
   }
 
-  // Normal message — if player has already guessed, mark as guessOnly so non-guessers can't see it
-  const msgRef = doc(collection(db, `rooms/${roomId}/chat`));
-  await setDoc(msgRef, {
+  const msgRef = push(ref(rtdb, `chat/${roomId}`));
+  await set(msgRef, {
     text: text.trim(),
     senderId: player.id,
     senderName: player.name,
@@ -173,23 +167,33 @@ export async function startGame(roomId: string, players: Player[], settings: Roo
 
   const wordCount = settings.wordCount ?? 3;
 
-  // Fetch word choices and reset scores in parallel
   const [choices] = await Promise.all([
-    fetchWordChoices(settings.categories, settings.customWords, wordCount),
+    fetchWordChoices(
+      Array.isArray(settings.categories)
+        ? settings.categories
+        : Object.keys(settings.categories as Record<string, boolean>),
+      settings.customWords,
+      wordCount
+    ),
     (async () => {
-      const batch = writeBatch(db);
-      players.forEach(p => { batch.update(doc(db, `rooms/${roomId}/players`, p.id), { score: 0, streak: 0, hasGuessed: false }); });
-      await batch.commit();
+      const updates: Record<string, unknown> = {};
+      players.forEach(p => {
+        updates[`players/${roomId}/${p.id}/score`] = 0;
+        updates[`players/${roomId}/${p.id}/streak`] = 0;
+        updates[`players/${roomId}/${p.id}/hasGuessed`] = false;
+      });
+      await update(ref(rtdb), updates);
     })(),
   ]);
 
-  await updateDoc(doc(db, 'rooms', roomId), {
-    phase: 'choosing',
-    wordChoices: choices,
-    votes: { skip: {} },
-    reactions: {},
-    turnOrder,
-    currentRound: {
+  const msgRef = push(ref(rtdb, `chat/${roomId}`));
+  const updates: Record<string, unknown> = {
+    [`rooms/${roomId}/phase`]: 'choosing',
+    [`rooms/${roomId}/wordChoices`]: choices,
+    [`rooms/${roomId}/votes`]: { skip: {} },
+    [`rooms/${roomId}/reactions`]: {},
+    [`rooms/${roomId}/turnOrder`]: turnOrder,
+    [`rooms/${roomId}/currentRound`]: {
       drawerId: firstDrawer.id,
       wordMask: '',
       wordLength: 0,
@@ -198,10 +202,15 @@ export async function startGame(roomId: string, players: Player[], settings: Roo
       roundNumber: 1,
       guessCount: 0
     },
-    lastActive: Date.now()
-  });
-
-  await sendSystemMessage(roomId, `Game started! ${firstDrawer.name} is choosing a word.`);
+    [`rooms/${roomId}/lastActive`]: Date.now(),
+    [`chat/${roomId}/${msgRef.key}`]: {
+      text: `Game started! ${firstDrawer.name} is choosing a word.`,
+      senderId: 'system', senderName: 'System',
+      isSystem: true, isCorrect: false, isGuessOnly: false,
+      timestamp: Date.now()
+    }
+  };
+  await update(ref(rtdb), updates);
 }
 
 export async function selectWord(roomId: string, word: string, drawerId: string, drawTime: number) {
@@ -224,48 +233,42 @@ export async function nextTurn(roomId: string, room: Room, players: Player[]) {
   if (!room.currentRound) return;
 
   const turnOrder = room.turnOrder ?? [...players].sort((a, b) => a.id.localeCompare(b.id)).map(p => p.id);
-
   const currentIndex = turnOrder.indexOf(room.currentRound.drawerId);
   let nextIndex = currentIndex + 1;
   let nextRoundNumber = room.currentRound.roundNumber;
 
-  if (nextIndex >= turnOrder.length) {
-    nextIndex = 0;
-    nextRoundNumber++;
-  }
+  if (nextIndex >= turnOrder.length) { nextIndex = 0; nextRoundNumber++; }
 
   if (nextRoundNumber > room.settings.rounds) {
-    await updateDoc(doc(db, 'rooms', roomId), { phase: 'ended', lastActive: Date.now() });
+    await update(ref(rtdb, `rooms/${roomId}`), { phase: 'ended', lastActive: Date.now() });
     return;
   }
 
   const wordCount = room.settings.wordCount ?? 3;
   const nextDrawerId = turnOrder[nextIndex];
-  const nextDrawer = players.find(p => p.id === nextDrawerId);
+  const drawer = players.find(p => p.id === nextDrawerId);
+  if (!drawer) { await update(ref(rtdb, `rooms/${roomId}`), { phase: 'ended', lastActive: Date.now() }); return; }
 
-  // Fetch word choices and reset player hasGuessed in parallel
+  const categories = Array.isArray(room.settings.categories)
+    ? room.settings.categories
+    : Object.keys(room.settings.categories as Record<string, boolean>);
+
   const [choices] = await Promise.all([
-    fetchWordChoices(room.settings.categories, room.settings.customWords, wordCount),
+    fetchWordChoices(categories, room.settings.customWords, wordCount),
     (async () => {
-      const batch = writeBatch(db);
-      players.forEach(p => { batch.update(doc(db, `rooms/${roomId}/players`, p.id), { hasGuessed: false }); });
-      await batch.commit();
+      const updates: Record<string, unknown> = {};
+      players.forEach(p => { updates[`players/${roomId}/${p.id}/hasGuessed`] = false; });
+      await update(ref(rtdb), updates);
     })(),
   ]);
 
-  const drawerId = nextDrawer?.id ?? (() => {
-    const remaining = turnOrder.filter(id => players.some(p => p.id === id));
-    return remaining[nextIndex % remaining.length];
-  })();
-  const drawer = players.find(p => p.id === drawerId);
-  if (!drawer) { await updateDoc(doc(db, 'rooms', roomId), { phase: 'ended', lastActive: Date.now() }); return; }
-
-  await updateDoc(doc(db, 'rooms', roomId), {
-    phase: 'choosing',
-    wordChoices: choices,
-    votes: { skip: {} },
-    reactions: {},
-    currentRound: {
+  const msgRef = push(ref(rtdb, `chat/${roomId}`));
+  const updates: Record<string, unknown> = {
+    [`rooms/${roomId}/phase`]: 'choosing',
+    [`rooms/${roomId}/wordChoices`]: choices,
+    [`rooms/${roomId}/votes`]: { skip: {} },
+    [`rooms/${roomId}/reactions`]: {},
+    [`rooms/${roomId}/currentRound`]: {
       drawerId: drawer.id,
       wordMask: '',
       wordLength: 0,
@@ -274,8 +277,13 @@ export async function nextTurn(roomId: string, room: Room, players: Player[]) {
       roundNumber: nextRoundNumber,
       guessCount: 0
     },
-    lastActive: Date.now()
-  });
-
-  await sendSystemMessage(roomId, `Round ${nextRoundNumber}! ${drawer.name} is choosing a word.`);
+    [`rooms/${roomId}/lastActive`]: Date.now(),
+    [`chat/${roomId}/${msgRef.key}`]: {
+      text: `Round ${nextRoundNumber}! ${drawer.name} is choosing a word.`,
+      senderId: 'system', senderName: 'System',
+      isSystem: true, isCorrect: false, isGuessOnly: false,
+      timestamp: Date.now()
+    }
+  };
+  await update(ref(rtdb), updates);
 }
