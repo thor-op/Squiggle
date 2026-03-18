@@ -242,7 +242,7 @@ export default function RoomPage() {
       const shouldTransition = rem <= 0 || (room.phase === 'drawing' && (allGuessed || skipVotes > guessers.length / 2));
       if (shouldTransition && transitionFired.current !== room.phase) {
         transitionFired.current = room.phase;
-        if (room.phase === 'choosing') selectWord(roomId, room.wordChoices?.[0] || 'apple', room.currentRound!.drawerId);
+        if (room.phase === 'choosing') selectWord(roomId, room.wordChoices?.[0] || 'apple', room.currentRound!.drawerId, room.settings.drawTime ?? 80);
         else if (room.phase === 'drawing') endRound(roomId);
         else if (room.phase === 'reveal') nextTurn(roomId, room, players);
       }
@@ -570,7 +570,7 @@ export default function RoomPage() {
                 <p className="text-black text-[10px] uppercase tracking-widest font-bold mb-6">Choose a word</p>
                 <div className="flex flex-col sm:flex-row gap-3 px-4">
                   {room.wordChoices?.map(word => (
-                    <button key={word} onClick={() => selectWord(roomId, word, room.currentRound!.drawerId)}
+                    <button key={word} onClick={() => selectWord(roomId, word, room.currentRound!.drawerId, room.settings.drawTime ?? 80)}
                       className="relative border border-black px-6 sm:px-8 py-3 sm:py-4 text-base sm:text-lg font-bold text-black hover:bg-black hover:text-white transition-all">
                       <Corners size={6} weight={1} color="text-zinc-400" />
                       {word}

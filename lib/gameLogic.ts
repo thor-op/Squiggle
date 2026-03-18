@@ -166,22 +166,22 @@ export async function sendChatMessage(
 }
 
 export async function startGame(roomId: string, players: Player[], settings: RoomSettings) {
-  // Fix turn order at game start — shuffle so it's not always the same person first
   const shuffled = [...players].sort(() => Math.random() - 0.5);
   const turnOrder = shuffled.map(p => p.id);
   const firstDrawer = shuffled[0];
   if (!firstDrawer) return;
 
   const wordCount = settings.wordCount ?? 3;
-  const choices = await fetchWordChoices(settings.categories, settings.customWords, wordCount);
 
-  const batch = writeBatch(db);
-  players.forEach(p => {
-    batch.update(doc(db, `rooms/${roomId}/players`, p.id), {
-      score: 0, streak: 0, hasGuessed: false
-    });
-  });
-  await batch.commit();
+  // Fetch word choices and reset scores in parallel
+  const [choices] = await Promise.all([
+    fetchWordChoices(settings.categories, settings.customWords, wordCount),
+    (async () => {
+      const batch = writeBatch(db);
+      players.forEach(p => { batch.update(doc(db, `rooms/${roomId}/players`, p.id), { score: 0, streak: 0, hasGuessed: false }); });
+      await batch.commit();
+    })(),
+  ]);
 
   await updateDoc(doc(db, 'rooms', roomId), {
     phase: 'choosing',
@@ -204,11 +204,11 @@ export async function startGame(roomId: string, players: Player[], settings: Roo
   await sendSystemMessage(roomId, `Game started! ${firstDrawer.name} is choosing a word.`);
 }
 
-export async function selectWord(roomId: string, word: string, drawerId: string) {
+export async function selectWord(roomId: string, word: string, drawerId: string, drawTime: number) {
   await fetch('/api/game', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'selectWord', roomId, word, drawerId }),
+    body: JSON.stringify({ action: 'selectWord', roomId, word, drawerId, drawTime }),
   });
 }
 
@@ -223,8 +223,6 @@ export async function endRound(roomId: string) {
 export async function nextTurn(roomId: string, room: Room, players: Player[]) {
   if (!room.currentRound) return;
 
-  // Use the fixed turn order stored at game start.
-  // Fall back to id-sort only if turnOrder is missing (old rooms).
   const turnOrder = room.turnOrder ?? [...players].sort((a, b) => a.id.localeCompare(b.id)).map(p => p.id);
 
   const currentIndex = turnOrder.indexOf(room.currentRound.drawerId);
@@ -241,36 +239,26 @@ export async function nextTurn(roomId: string, room: Room, players: Player[]) {
     return;
   }
 
+  const wordCount = room.settings.wordCount ?? 3;
   const nextDrawerId = turnOrder[nextIndex];
   const nextDrawer = players.find(p => p.id === nextDrawerId);
-  if (!nextDrawer) {
-    // Player left — skip to next in order
+
+  // Fetch word choices and reset player hasGuessed in parallel
+  const [choices] = await Promise.all([
+    fetchWordChoices(room.settings.categories, room.settings.customWords, wordCount),
+    (async () => {
+      const batch = writeBatch(db);
+      players.forEach(p => { batch.update(doc(db, `rooms/${roomId}/players`, p.id), { hasGuessed: false }); });
+      await batch.commit();
+    })(),
+  ]);
+
+  const drawerId = nextDrawer?.id ?? (() => {
     const remaining = turnOrder.filter(id => players.some(p => p.id === id));
-    if (remaining.length === 0) { await updateDoc(doc(db, 'rooms', roomId), { phase: 'ended', lastActive: Date.now() }); return; }
-    const fallbackId = remaining[nextIndex % remaining.length];
-    const fallback = players.find(p => p.id === fallbackId)!;
-    const wordCount = room.settings.wordCount ?? 3;
-    const choices = await fetchWordChoices(room.settings.categories, room.settings.customWords, wordCount);
-    const batch = writeBatch(db);
-    players.forEach(p => { batch.update(doc(db, `rooms/${roomId}/players`, p.id), { hasGuessed: false }); });
-    await batch.commit();
-    await updateDoc(doc(db, 'rooms', roomId), {
-      phase: 'choosing', wordChoices: choices, votes: { skip: {} }, reactions: {},
-      currentRound: { drawerId: fallback.id, wordMask: '', wordLength: 0, startedAt: Date.now(), timeLimit: 15, roundNumber: nextRoundNumber, guessCount: 0 },
-      lastActive: Date.now()
-    });
-    await sendSystemMessage(roomId, `Round ${nextRoundNumber}! ${fallback.name} is choosing a word.`);
-    return;
-  }
-
-  const wordCount = room.settings.wordCount ?? 3;
-  const choices = await fetchWordChoices(room.settings.categories, room.settings.customWords, wordCount);
-
-  const batch = writeBatch(db);
-  players.forEach(p => {
-    batch.update(doc(db, `rooms/${roomId}/players`, p.id), { hasGuessed: false });
-  });
-  await batch.commit();
+    return remaining[nextIndex % remaining.length];
+  })();
+  const drawer = players.find(p => p.id === drawerId);
+  if (!drawer) { await updateDoc(doc(db, 'rooms', roomId), { phase: 'ended', lastActive: Date.now() }); return; }
 
   await updateDoc(doc(db, 'rooms', roomId), {
     phase: 'choosing',
@@ -278,7 +266,7 @@ export async function nextTurn(roomId: string, room: Room, players: Player[]) {
     votes: { skip: {} },
     reactions: {},
     currentRound: {
-      drawerId: nextDrawer.id,
+      drawerId: drawer.id,
       wordMask: '',
       wordLength: 0,
       startedAt: Date.now(),
@@ -289,5 +277,5 @@ export async function nextTurn(roomId: string, room: Room, players: Player[]) {
     lastActive: Date.now()
   });
 
-  await sendSystemMessage(roomId, `Round ${nextRoundNumber}! ${nextDrawer.name} is choosing a word.`);
+  await sendSystemMessage(roomId, `Round ${nextRoundNumber}! ${drawer.name} is choosing a word.`);
 }
